@@ -1,0 +1,109 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import plotly.graph_objects as go
+from scipy.ndimage import label, gaussian_filter
+from scipy.sparse import csr_matrix
+from sklearn.linear_model import ElasticNetCV
+from sklearn.mixture import GaussianMixture
+from codes import prism
+
+nx, ny = 50, 50
+x = np.linspace(-5000, 5000, nx)
+y = np.linspace(-5000, 5000, ny)
+X, Y = np.meshgrid(x, y)
+Z = -50 * np.ones_like(X)
+
+incf, decf = -45, -30
+incs, decs = -34.25, -18.5
+
+prism1 = [-3000, 0, 0, 3000, 200, 600, 10]
+data_true1 = prism.my_prism_tf(X, Y, Z, prism1,
+                               mag=prism1[6],
+                               inc=incf, dec=decf,
+                               incs=incs, decs=decs)
+
+prism2 = [1000, 3500, -3000, -1000, 100, 700, 9]
+data_true2 = prism.my_prism_tf(X, Y, Z, prism2,
+                               mag=prism2[6],
+                               inc=incf, dec=decf,
+                               incs=incs, decs=decs)
+
+data_true = data_true1 + data_true2
+noise = np.random.normal(0, 0.05 * np.max(np.abs(data_true)), size=X.shape)
+data_obs = data_true + noise
+data_obs_clean = gaussian_filter(data_obs, sigma=1.5)
+
+current_nx, current_ny, current_nz = 10, 10, 5
+x_edges = np.linspace(-4500, 4500, current_nx + 1)
+y_edges = np.linspace(-4500, 4500, current_ny + 1)
+z_edges = np.linspace(0, 1200, current_nz + 1)
+
+z_min, z_max = 0, 800
+voxels, voxel_ijk, valid_z_indices = [], [], []
+
+for k in range(current_nz):
+    zc = 0.5 * (z_edges[k] + z_edges[k+1])
+    if z_min <= zc <= z_max:
+        valid_z_indices.append(k)
+
+for i in range(current_nx):
+    for j in range(current_ny):
+        for k in valid_z_indices:
+            voxels.append([x_edges[i], x_edges[i+1],
+                           y_edges[j], y_edges[j+1],
+                           z_edges[k], z_edges[k+1], 1.0])
+            voxel_ijk.append((i, j, valid_z_indices.index(k)))
+
+row, col, data = [], [], []
+for v, vox in enumerate(voxels):
+    temp = prism.my_prism_tf(X, Y, Z, vox, mag=1.0,
+                             inc=incf, dec=decf,
+                             incs=incs, decs=decs).ravel()
+    for i in range(X.size):
+        if abs(temp[i]) > 1e-10:
+            row.append(i)
+            col.append(v)
+            data.append(temp[i])
+
+G = csr_matrix((data, (row, col)), shape=(X.size, len(voxels)))
+
+depth_centers = np.array([0.5 * (vox[4] + vox[5]) for vox in voxels])
+depth_weight = np.exp(-depth_centers / 400.0)
+G_weighted = G.multiply(depth_weight)
+G_dense = G_weighted.toarray()
+
+d = data_obs_clean.ravel()
+
+elastic = ElasticNetCV(
+    l1_ratio=[0.1, 0.3, 0.5, 0.7, 0.9],
+    alphas=np.logspace(-4, -1, 10),
+    cv=5,
+    positive=True,
+    max_iter=10000
+)
+elastic.fit(G_dense, d)
+
+m_est = elastic.coef_
+num_z_levels = len(valid_z_indices)
+m_est_3d = gaussian_filter(m_est.reshape(current_nx, current_ny, num_z_levels), sigma=0.3)
+
+gmm = GaussianMixture(n_components=2, random_state=0)
+gmm.fit(m_est_3d.ravel().reshape(-1, 1))
+probs = gmm.predict_proba(m_est_3d.ravel().reshape(-1, 1))[:, np.argmax(gmm.means_)]
+mask = probs.reshape(current_nx, current_ny, num_z_levels) > 0.75
+
+labeled, num = label(mask)
+if num > 0:
+    comp_sizes = [np.sum(labeled == i) for i in range(1, num + 1)]
+    top_idx = np.argsort(comp_sizes)[-2:]
+    conn_mask = np.zeros_like(mask)
+    for idx in top_idx:
+        conn_mask |= (labeled == idx + 1)
+    m_est_3d_conn = m_est_3d * conn_mask
+else:
+    m_est_3d_conn = np.zeros_like(m_est_3d)
+
+m_vox_for_pred = np.array([m_est_3d_conn[ii, jj, kk] for (ii, jj, kk) in voxel_ijk])
+data_pred = (G @ m_vox_for_pred).reshape(X.shape)
+resid = data_obs - data_pred
+rms = np.sqrt(np.mean(resid**2))
